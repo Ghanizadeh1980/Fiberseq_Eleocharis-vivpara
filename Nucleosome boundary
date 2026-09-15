@@ -1,0 +1,131 @@
+import argparse, zipfile, itertools
+from pathlib import Path
+import numpy as np
+import pandas as pd
+from scipy import stats
+
+SAMPLES=['Aqua_1','Terres_1','Aqua_2','Terres_2','Aqua_5','Terres_5']
+PAIRS=[1,2,5]
+
+def exact_signflip(d):
+    d=np.asarray(d,float); obs=abs(np.mean(d))
+    vals=[abs(np.mean(d*np.asarray(s))) for s in itertools.product([-1,1],repeat=len(d))]
+    return float(np.mean(np.asarray(vals)>=obs-1e-15))
+
+def paired_record(fire_set,metric,sub,ter,diffs):
+    d=np.asarray(diffs,float); n=len(d); mean=float(np.mean(d)); sd=float(np.std(d,ddof=1)); se=sd/np.sqrt(n)
+    tcrit=stats.t.ppf(.975,n-1); lo=mean-tcrit*se; hi=mean+tcrit*se
+    tt=stats.ttest_rel(ter,sub)
+    try: wp=float(stats.wilcoxon(d,method='exact').pvalue)
+    except Exception: wp=np.nan
+    return dict(FIRE_set=fire_set,metric=metric,n_clone_pairs=n,Submerged_mean=float(np.mean(sub)),Terrestrial_mean=float(np.mean(ter)),mean_paired_difference=mean,SD_paired_difference=sd,SE_paired_difference=se,CI95_low=lo,CI95_high=hi,paired_t=float(tt.statistic),df=n-1,paired_t_P=float(tt.pvalue),Wilcoxon_exact_P=wp,exact_sign_flip_P=exact_signflip(d),Cohen_dz=mean/sd if sd else np.nan,percent_change=100*mean/np.mean(sub),Terrestrial_to_Submerged_ratio=np.mean(ter)/np.mean(sub),all_three_pairs_same_direction=bool(np.all(d>0) or np.all(d<0)),pair_1_difference=d[0],pair_2_difference=d[1],pair_5_difference=d[2])
+
+def read_stage1(zf,sample,ids=None):
+    member=f'Eleocharis_stage1_fast_v3_outputs/{sample}.fire_molecular_states.tsv.gz'
+    cols=['fire_id','molecular_actuation_probability','mean_open_msp_length','mean_closed_nucleosome_length','closed_containing_nucleosome_mean_offset','open_upstream_nucleosome_mean_offset','open_downstream_nucleosome_mean_offset']
+    with zf.open(member) as h: d=pd.read_csv(h,sep='\t',compression='gzip',usecols=cols)
+    if ids is not None: d=d[d.fire_id.isin(ids)]
+    d[f'{sample}_upstream_abs']=d.open_upstream_nucleosome_mean_offset.abs()
+    d[f'{sample}_downstream_abs']=d.open_downstream_nucleosome_mean_offset.abs()
+    d[f'{sample}_flanking_mean']=(d[f'{sample}_upstream_abs']+d[f'{sample}_downstream_abs'])/2
+    d[f'{sample}_closed_center_abs']=d.closed_containing_nucleosome_mean_offset.abs()
+    ren={c:f'{sample}_{c}' for c in ['molecular_actuation_probability','mean_open_msp_length','mean_closed_nucleosome_length']}
+    return d[['fire_id',f'{sample}_molecular_actuation_probability' if False else 'molecular_actuation_probability','mean_open_msp_length','mean_closed_nucleosome_length',f'{sample}_closed_center_abs',f'{sample}_upstream_abs',f'{sample}_downstream_abs',f'{sample}_flanking_mean']].rename(columns=ren)
+
+def main():
+    ap=argparse.ArgumentParser()
+    ap.add_argument('--stage1-zip',type=Path,required=True)
+    ap.add_argument('--fire-annotation',type=Path,required=True)
+    ap.add_argument('--gene-landscape',type=Path,required=True)
+    ap.add_argument('--c4-paralog-table',type=Path,required=True)
+    ap.add_argument('--output-dir',type=Path,required=True)
+    a=ap.parse_args(); a.output_dir.mkdir(parents=True,exist_ok=True)
+    ann=pd.read_csv(a.fire_annotation,sep='\t')
+    genes=pd.read_csv(a.gene_landscape,sep='\t')
+    gcols=['gene_id','display_annotation','Preferred_name','GeneSymbol','Expression_log2FC','qvalue','DE_direction','Aqua_mean_FPKM','Terres_mean_FPKM']
+    genes=genes[[c for c in gcols if c in genes.columns]].copy()
+    def label(r):
+        for c in ['Preferred_name','GeneSymbol','display_annotation']:
+            v=r.get(c)
+            if pd.notna(v) and str(v).strip(): return str(v)
+        return r.gene_id
+    genes['gene_name']=genes.apply(label,axis=1)
+    hc=ann[ann.high_confidence_differential_actuation & ann.regulatory_class.isin(['promoter','gene_body','distal'])].copy()
+    ids=set(hc.fire_id)
+    base=hc.merge(genes,on='gene_id',how='left')
+    with zipfile.ZipFile(a.stage1_zip) as zf:
+        for s in SAMPLES:
+            base=base.merge(read_stage1(zf,s,ids),on='fire_id',how='left',validate='one_to_one')
+    for p in PAIRS:
+        A=f'Aqua_{p}'; T=f'Terres_{p}'
+        base[f'pair_{p}_actuation_change']=base[f'{T}_molecular_actuation_probability']-base[f'{A}_molecular_actuation_probability']
+        base[f'pair_{p}_boundary_change']=base[f'{T}_flanking_mean']-base[f'{A}_flanking_mean']
+        base[f'pair_{p}_upstream_change']=base[f'{T}_upstream_abs']-base[f'{A}_upstream_abs']
+        base[f'pair_{p}_downstream_change']=base[f'{T}_downstream_abs']-base[f'{A}_downstream_abs']
+    base['mean_boundary_change']=base[[f'pair_{p}_boundary_change' for p in PAIRS]].mean(axis=1)
+    base['mean_upstream_change']=base[[f'pair_{p}_upstream_change' for p in PAIRS]].mean(axis=1)
+    base['mean_downstream_change']=base[[f'pair_{p}_downstream_change' for p in PAIRS]].mean(axis=1)
+    base['expression_group']=np.where(base.DE_direction.eq('Terrestrial_up'),'Terrestrial_upregulated',np.where(base.DE_direction.eq('Submerged_up'),'Submerged_upregulated','Not_differentially_expressed'))
+    prom=base[base.regulatory_class.eq('promoter')].copy()
+    prom_cols=['fire_id','chrom','start','end','gene_id','gene_name','distance_to_tss','molecular_direction','mean_delta_probability','mean_delta_normalized_logodds','mean_boundary_change','mean_upstream_change','mean_downstream_change','Expression_log2FC','qvalue','DE_direction']
+    prom[prom_cols].to_csv(a.output_dir/'Source_data_high_confidence_promoter_FIREs.tsv',sep='\t',index=False)
+    ter=prom[prom.molecular_direction.eq('Terrestrial_open')].copy()
+    ter.to_csv(a.output_dir/'Source_data_Terrestrial_open_promoter_FIREs.tsv',sep='\t',index=False)
+    # Sample-level metrics and paired tests
+    records=[]; sample_rows=[]
+    metrics=[('combined_flanking_distance_bp','combined'),('upstream_flanking_distance_bp','upstream'),('downstream_flanking_distance_bp','downstream'),('open_MSP_length_bp','msp'),('closed_nucleosome_length_bp','closed_len'),('closed_center_absolute_offset_bp','closed_center')]
+    for direction in ['Terrestrial_open','Submerged_open']:
+        z=prom[prom.molecular_direction.eq(direction)]
+        values={}
+        for s in SAMPLES:
+            values[(s,'combined')]=float(pd.concat([z[f'{s}_upstream_abs'],z[f'{s}_downstream_abs']]).median())
+            values[(s,'upstream')]=float(z[f'{s}_upstream_abs'].median())
+            values[(s,'downstream')]=float(z[f'{s}_downstream_abs'].median())
+            values[(s,'msp')]=float(z[f'{s}_mean_open_msp_length'].median())
+            values[(s,'closed_len')]=float(z[f'{s}_mean_closed_nucleosome_length'].median())
+            values[(s,'closed_center')]=float(z[f'{s}_closed_center_abs'].median())
+            values[(s,'actuation')]=float(z[f'{s}_molecular_actuation_probability'].mean())
+        for p in PAIRS:
+            A=f'Aqua_{p}';T=f'Terres_{p}'
+            sample_rows.append(dict(FIRE_set=direction,clone_pair=p,n_FIRE=len(z),Submerged_upstream_bp=values[(A,'upstream')],Terrestrial_upstream_bp=values[(T,'upstream')],upstream_difference_bp=values[(T,'upstream')]-values[(A,'upstream')],Submerged_downstream_bp=values[(A,'downstream')],Terrestrial_downstream_bp=values[(T,'downstream')],downstream_difference_bp=values[(T,'downstream')]-values[(A,'downstream')],Submerged_combined_bp=values[(A,'combined')],Terrestrial_combined_bp=values[(T,'combined')],combined_difference_bp=values[(T,'combined')]-values[(A,'combined')],combined_percent_change=100*(values[(T,'combined')]-values[(A,'combined')])/values[(A,'combined')],Submerged_actuation_probability=values[(A,'actuation')],Terrestrial_actuation_probability=values[(T,'actuation')],actuation_probability_difference=values[(T,'actuation')]-values[(A,'actuation')],Submerged_open_MSP_length_bp=values[(A,'msp')],Terrestrial_open_MSP_length_bp=values[(T,'msp')],open_MSP_difference_bp=values[(T,'msp')]-values[(A,'msp')],Submerged_closed_nucleosome_length_bp=values[(A,'closed_len')],Terrestrial_closed_nucleosome_length_bp=values[(T,'closed_len')],closed_nucleosome_length_difference_bp=values[(T,'closed_len')]-values[(A,'closed_len')],Submerged_closed_center_offset_bp=values[(A,'closed_center')],Terrestrial_closed_center_offset_bp=values[(T,'closed_center')],closed_center_offset_difference_bp=values[(T,'closed_center')]-values[(A,'closed_center')]))
+        for label,key in metrics:
+            sub=[values[(f'Aqua_{p}',key)] for p in PAIRS]; tr=[values[(f'Terres_{p}',key)] for p in PAIRS]
+            records.append(paired_record(direction,label,sub,tr,np.asarray(tr)-np.asarray(sub)))
+    pd.DataFrame(sample_rows).to_csv(a.output_dir/'Table_sample_level_boundary_measurements.tsv',sep='\t',index=False)
+    pd.DataFrame(records).to_csv(a.output_dir/'Table_clone_paired_statistical_tests.tsv',sep='\t',index=False)
+    # FIRE-level distributions and correlations
+    dist=[]
+    for direction,z in prom.groupby('molecular_direction'):
+        if direction=='Not_HC': continue
+        for p in PAIRS:
+            x=z[f'pair_{p}_boundary_change'].dropna(); act=z[f'pair_{p}_actuation_change'].loc[x.index]
+            rho,pv=stats.spearmanr(x,act)
+            dist.append(dict(FIRE_set=direction,clone_pair=p,n_FIRE_total=len(z),n_FIRE_with_boundary_estimate=len(x),median_per_FIRE_boundary_change_bp=x.median(),mean_per_FIRE_boundary_change_bp=x.mean(),Q25_boundary_change_bp=x.quantile(.25),Q75_boundary_change_bp=x.quantile(.75),fraction_positive_boundary_change=(x>0).mean(),fraction_negative_boundary_change=(x<0).mean(),Spearman_rho_boundary_vs_actuation=rho,Spearman_P_boundary_vs_actuation=pv))
+    pd.DataFrame(dist).to_csv(a.output_dir/'Table_per_FIRE_distributions.tsv',sep='\t',index=False)
+    conc=[]
+    for direction,z in prom.groupby('molecular_direction'):
+        if direction=='Not_HC': continue
+        D=z[[f'pair_{p}_boundary_change' for p in PAIRS]].dropna()
+        same=((D>0).all(axis=1)|(D<0).all(axis=1))
+        conc.append(dict(FIRE_set=direction,n_FIRE_complete_all_three_pairs=len(D),n_FIRE_concordant_all_three_pairs=int(same.sum()),fraction_concordant_all_three_pairs=float(same.mean())))
+    pd.DataFrame(conc).to_csv(a.output_dir/'Table_three_pair_concordance.tsv',sep='\t',index=False)
+    corr=[]
+    for name,z in [('All_high_confidence_promoters',prom),('Terrestrial_open',ter),('Submerged_open',prom[prom.molecular_direction.eq('Submerged_open')])]:
+        q=z[['mean_delta_probability','mean_boundary_change']].dropna(); rho,pv=stats.spearmanr(q.iloc[:,0],q.iloc[:,1]); corr.append(dict(FIRE_set=name,n_FIRE=len(q),Spearman_rho=rho,Spearman_P=pv))
+    pd.DataFrame(corr).to_csv(a.output_dir/'Table_actuation_boundary_correlations.tsv',sep='\t',index=False)
+    # TSS bins and expression groups for Terrestrial-open promoters
+    edges=[-2000,-1000,-500,-250,0,251,501]; labels=['minus 2000 to minus 1001','minus 1000 to minus 501','minus 500 to minus 251','minus 250 to minus 1','0 to plus 250','251 to plus 500']
+    ter['TSS_distance_bin']=pd.cut(ter.distance_to_tss,bins=edges,right=False,labels=labels)
+    tss=[]
+    for lab,z in ter.groupby('TSS_distance_bin',observed=True):
+        x=z.mean_boundary_change.dropna(); tss.append(dict(TSS_distance_bin=str(lab),n_FIRE=len(x),median_boundary_change_bp=x.median(),mean_boundary_change_bp=x.mean(),Q25_boundary_change_bp=x.quantile(.25),Q75_boundary_change_bp=x.quantile(.75),fraction_positive_boundary_change=(x>0).mean(),median_actuation_probability_change=z.mean_delta_probability.median()))
+    pd.DataFrame(tss).to_csv(a.output_dir/'Table_promoter_position_sensitivity.tsv',sep='\t',index=False)
+    ex=[]
+    for grp,z in ter.groupby('expression_group'):
+        x=z.mean_boundary_change.dropna(); ex.append(dict(expression_group=grp,n_FIRE=len(x),n_unique_genes=z.gene_id.nunique(),median_boundary_change_bp=x.median(),mean_boundary_change_bp=x.mean(),Q25_boundary_change_bp=x.quantile(.25),Q75_boundary_change_bp=x.quantile(.75),fraction_positive_boundary_change=(x>0).mean(),median_RNA_log2FC=z.Expression_log2FC.median()))
+    pd.DataFrame(ex).to_csv(a.output_dir/'Table_expression_group_boundary_changes.tsv',sep='\t',index=False)
+    # C4 examples
+    c4=pd.read_csv(a.c4_paralog_table,sep='\t'); c4ids=set(c4.loc[c4.curated_C4,'gene_id'])
+    ter[ter.gene_id.isin(c4ids)].to_csv(a.output_dir/'Table_C4_associated_promoter_FIREs.tsv',sep='\t',index=False)
+
+if __name__=='__main__': main()
