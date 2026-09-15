@@ -1,0 +1,40 @@
+import numpy as np
+import pandas as pd
+from scipy.stats import fisher_exact
+
+def main():
+    ap=argparse.ArgumentParser()
+    ap.add_argument('--c4-table',type=Path,required=True)
+    ap.add_argument('--output',type=Path,required=True)
+    ap.add_argument('--permutations',type=int,default=20000)
+    ap.add_argument('--seed',type=int,default=42)
+    a=ap.parse_args()
+    d=pd.read_csv(a.c4_table,sep='\t')
+    d=d[d.get('expressed',True).astype(bool)].copy() if 'expressed' in d else d.copy()
+    if 'family_percentile_expression_change' not in d:
+        d['family_rank_expression_change']=d.groupby('family')['Expression_log2FC'].rank(method='first',ascending=False)
+        d['family_percentile_expression_change']=d.groupby('family')['Expression_log2FC'].rank(method='average',pct=True)
+    cur=d[d.curated_C4.astype(bool)].copy(); other=d[~d.curated_C4.astype(bool)].copy()
+    observed=float(cur.family_percentile_expression_change.mean())
+    family_counts=cur.groupby('family').size().to_dict()
+    rng=np.random.default_rng(a.seed); null=np.empty(a.permutations,float)
+    groups={fam:g.family_percentile_expression_change.to_numpy(float) for fam,g in d.groupby('family')}
+    for i in range(a.permutations):
+        values=[]
+        for fam,k in family_counts.items(): values.extend(rng.choice(groups[fam],size=int(k),replace=False))
+        null[i]=np.mean(values)
+    permutation_p=(np.sum(null>=observed)+1)/(a.permutations+1)
+    # Upper-half classification follows the stored within-family percentile, where values above 0.5 are in the upper half.
+    cur_top=cur.family_percentile_expression_change.gt(.5)
+    other_top=other.family_percentile_expression_change.gt(.5)
+    top_or,top_p=fisher_exact([[int(cur_top.sum()),int((~cur_top).sum())],[int(other_top.sum()),int((~other_top).sum())]],alternative='two-sided')
+    def local_T(x):
+        if 'any_Terrestrial_open' in x: return x.any_Terrestrial_open.astype(bool)
+        cols=[c for c in ['promoter_n_HC_Terrestrial_open','gene_body_n_HC_Terrestrial_open','distal_n_HC_Terrestrial_open'] if c in x]
+        return x[cols].fillna(0).sum(axis=1).gt(0)
+    cur_event=local_T(cur); other_event=local_T(other)
+    event_or,event_p=fisher_exact([[int(cur_event.sum()),int((~cur_event).sum())],[int(other_event.sum()),int((~other_event).sum())]],alternative='two-sided')
+    out=pd.DataFrame([dict(n_expressed_paralogs=len(d),n_curated=len(cur),curated_mean_within_family_percentile=observed,permutation_null_mean=float(null.mean()),permutation_p=permutation_p,top_half_odds_ratio=top_or,top_half_fisher_p=top_p,molecular_support_odds_ratio=event_or,molecular_support_fisher_p=event_p,permutations=a.permutations,random_seed=a.seed)])
+    a.output.parent.mkdir(parents=True,exist_ok=True); out.to_csv(a.output,sep='\t',index=False)
+    print(out.to_string(index=False))
+if __name__=='__main__': main()
