@@ -1,0 +1,76 @@
+import numpy as np
+import pandas as pd
+from scipy import stats
+from statsmodels.stats.multitest import multipletests
+
+SAMPLES=['Terres_1','Terres_2','Aqua_5','Aqua_1','Aqua_2','Terres_5']
+PAIRS=[1,2,5]
+COUNT_COLS=['both_open','left_open_right_closed','left_closed_right_open','both_closed','unresolved','informative_fibers']
+PRIOR_DF=1000.0
+PRIOR_VAR=1.2684006896671056
+
+def read_sample(zf:zipfile.ZipFile,sample:str)->pd.DataFrame:
+    member=f'Eleocharis_stage1_fast_v3_outputs/{sample}.adjacent_fire_coactuation.tsv.gz'
+    with zf.open(member) as h:
+        d=pd.read_csv(h,sep='\t',compression='gzip',usecols=['pair_id','chrom','left_fire_id','right_fire_id','gap_bp']+COUNT_COLS)
+    ren={c:f'{sample}_{c}' for c in COUNT_COLS}
+    return d.rename(columns=ren)
+
+def log2_or(d:pd.DataFrame,s:str)->np.ndarray:
+    a=d[f'{s}_both_open'].to_numpy(float)
+    b=d[f'{s}_left_open_right_closed'].to_numpy(float)
+    c=d[f'{s}_left_closed_right_open'].to_numpy(float)
+    e=d[f'{s}_both_closed'].to_numpy(float)
+    return np.log2(((a+0.5)*(e+0.5))/((b+0.5)*(c+0.5)))
+
+def main():
+    ap=argparse.ArgumentParser()
+    ap.add_argument('--stage1-zip',type=Path,required=True)
+    ap.add_argument('--output',type=Path,required=True)
+    ap.add_argument('--min-informative',type=int,default=20)
+    ap.add_argument('--prior-df',type=float,default=PRIOR_DF)
+    ap.add_argument('--prior-variance',type=float,default=PRIOR_VAR)
+    ap.add_argument('--effect-threshold',type=float,default=0.75)
+    ap.add_argument('--fdr',type=float,default=0.05)
+    args=ap.parse_args()
+    with zipfile.ZipFile(args.stage1_zip) as zf:
+        out=None
+        for i,s in enumerate(SAMPLES):
+            x=read_sample(zf,s)
+            if out is None:
+                out=x
+            else:
+                out=out.merge(x,on=['pair_id','chrom','left_fire_id','right_fire_id','gap_bp'],how='outer',validate='one_to_one')
+    for s in ['Aqua_1','Aqua_2','Aqua_5','Terres_1','Terres_2','Terres_5']:
+        out[f'{s}_log2_or']=log2_or(out,s)
+    for p in PAIRS:
+        out[f'pair{p}_delta_log2_or']=out[f'Terres_{p}_log2_or']-out[f'Aqua_{p}_log2_or']
+    D=out[[f'pair{p}_delta_log2_or' for p in PAIRS]].to_numpy(float)
+    out['mean_delta_log2_or']=np.nanmean(D,axis=1)
+    infcols=[f'{s}_informative_fibers' for s in ['Aqua_1','Aqua_2','Aqua_5','Terres_1','Terres_2','Terres_5']]
+    out['eligible']=out[infcols].ge(args.min_informative).all(axis=1)
+    complete=np.isfinite(D).all(axis=1)
+    sv=np.full(len(out),np.nan)
+    sv[complete]=np.var(D[complete],axis=1,ddof=1)
+    post=(args.prior_df*args.prior_variance+2*sv)/(args.prior_df+2)
+    t=np.full(len(out),np.nan)
+    t[complete]=out.loc[complete,'mean_delta_log2_or'].to_numpy()/np.sqrt(post[complete]/3)
+    out['moderated_t']=t
+    out['moderated_p']=2*stats.t.sf(np.abs(t),df=args.prior_df+2)
+    out['moderated_fdr']=np.nan
+    m=out['eligible']&out['moderated_p'].notna()
+    out.loc[m,'moderated_fdr']=multipletests(out.loc[m,'moderated_p'],method='fdr_bh')[1]
+    out['direction_consistency_n']=np.maximum(np.sum(D>0,axis=1),np.sum(D<0,axis=1))
+    out['high_confidence_coordination_change']=(out.eligible & out.moderated_fdr.lt(args.fdr) & out.mean_delta_log2_or.abs().ge(args.effect_threshold) & out.direction_consistency_n.eq(3))
+    out['coordination_direction']='Not_HC'
+    out.loc[out.high_confidence_coordination_change & out.mean_delta_log2_or.gt(0),'coordination_direction']='Terrestrial_gain'
+    out.loc[out.high_confidence_coordination_change & out.mean_delta_log2_or.lt(0),'coordination_direction']='Terrestrial_loss'
+    order=['pair_id','chrom','left_fire_id','right_fire_id','gap_bp']
+    for s in SAMPLES:
+        order += [f'{s}_{c}' for c in COUNT_COLS]
+    order += [f'{s}_log2_or' for s in ['Aqua_1','Aqua_2','Aqua_5','Terres_1','Terres_2','Terres_5']]
+    order += [f'pair{p}_delta_log2_or' for p in PAIRS]+['mean_delta_log2_or','moderated_t','moderated_p','moderated_fdr','direction_consistency_n','eligible','high_confidence_coordination_change','coordination_direction']
+    args.output.parent.mkdir(parents=True,exist_ok=True)
+    out[order].to_csv(args.output,sep='\t',index=False,compression='gzip')
+    print(json.dumps({'rows':len(out),'eligible':int(out.eligible.sum()),'high_confidence':int(out.high_confidence_coordination_change.sum()),'gains':int((out.coordination_direction=='Terrestrial_gain').sum()),'losses':int((out.coordination_direction=='Terrestrial_loss').sum())},indent=2))
+if __name__=='__main__': main()
