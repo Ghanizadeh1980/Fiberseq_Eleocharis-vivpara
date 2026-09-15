@@ -1,0 +1,615 @@
+import argparse
+import bisect
+import gzip
+import math
+import os
+import re
+import statistics
+import sys
+import time
+from array import array
+from dataclasses import dataclass
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
+CIGAR_RE = re.compile(r"(\d+)([MIDNSHP=X])")
+MM_GROUP_RE = re.compile(r"^([ACGTUN])([+-])([a-z]+|[0-9]+)([.?]?)(?:,(.*))?$")
+REVCOMP = str.maketrans("ACGTNacgtn", "TGCANtgcan")
+
+
+@dataclass(frozen=True)
+class FireRegion:
+    chrom: str
+    start: int
+    end: int
+    fire_id: str
+    width: int
+    pooled_fdr: float
+    pooled_direction: str
+
+
+@dataclass(frozen=True)
+class FirePair:
+    pair_id: str
+    chrom: str
+    left_fire_id: str
+    right_fire_id: str
+    gap_bp: int
+
+
+class ChromFireIndex:
+    def __init__(self, regions: Sequence[FireRegion], global_indices: Sequence[int]):
+        self.regions = list(regions)
+        self.global_indices = list(global_indices)
+        self.starts = [r.start for r in regions]
+        self.ends = [r.end for r in regions]
+
+    def fully_spanned(self, ref_start: int, ref_end: int) -> List[Tuple[int, FireRegion, int]]:
+        """Return local index, region, and global index for regions fully spanned."""
+        i = bisect.bisect_left(self.starts, ref_start)
+        out: List[Tuple[int, FireRegion, int]] = []
+        n = len(self.regions)
+        while i < n and self.starts[i] < ref_end:
+            if self.ends[i] <= ref_end:
+                out.append((i, self.regions[i], self.global_indices[i]))
+            i += 1
+        return out
+
+
+def open_text(path: str):
+    return gzip.open(path, "rt") if path.endswith(".gz") else open(path, "rt")
+
+
+def parse_float(value: str, default: float = math.nan) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def load_fires(path: str) -> Tuple[List[FireRegion], Dict[str, ChromFireIndex], Dict[str, int]]:
+    fires: List[FireRegion] = []
+    with open_text(path) as fh:
+        header = fh.readline().rstrip("\n").split("\t")
+        col = {name: i for i, name in enumerate(header)}
+        required = ["chrom", "start", "end", "fire_id", "width", "pooled_fdr", "pooled_direction"]
+        missing = [x for x in required if x not in col]
+        if missing:
+            raise ValueError(f"Missing FIRE columns: {', '.join(missing)}")
+        for line in fh:
+            if not line.strip():
+                continue
+            f = line.rstrip("\n").split("\t")
+            fires.append(
+                FireRegion(
+                    chrom=f[col["chrom"]],
+                    start=int(f[col["start"]]),
+                    end=int(f[col["end"]]),
+                    fire_id=f[col["fire_id"]],
+                    width=int(f[col["width"]]),
+                    pooled_fdr=parse_float(f[col["pooled_fdr"]]),
+                    pooled_direction=f[col["pooled_direction"]],
+                )
+            )
+    by_chrom: Dict[str, List[Tuple[FireRegion, int]]] = {}
+    id_to_index: Dict[str, int] = {}
+    for gi, fire in enumerate(fires):
+        id_to_index[fire.fire_id] = gi
+        by_chrom.setdefault(fire.chrom, []).append((fire, gi))
+    chrom_index: Dict[str, ChromFireIndex] = {}
+    for chrom, values in by_chrom.items():
+        values.sort(key=lambda x: (x[0].start, x[0].end))
+        chrom_index[chrom] = ChromFireIndex([x[0] for x in values], [x[1] for x in values])
+    return fires, chrom_index, id_to_index
+
+
+def load_pairs(path: str, fire_id_to_index: Dict[str, int]) -> Tuple[List[FirePair], Dict[Tuple[int, int], int]]:
+    pairs: List[FirePair] = []
+    lookup: Dict[Tuple[int, int], int] = {}
+    with open_text(path) as fh:
+        header = fh.readline().rstrip("\n").split("\t")
+        col = {name: i for i, name in enumerate(header)}
+        required = ["pair_id", "chrom", "left_fire_id", "right_fire_id", "gap_bp"]
+        missing = [x for x in required if x not in col]
+        if missing:
+            raise ValueError(f"Missing pair columns: {', '.join(missing)}")
+        for line in fh:
+            if not line.strip():
+                continue
+            f = line.rstrip("\n").split("\t")
+            left = f[col["left_fire_id"]]
+            right = f[col["right_fire_id"]]
+            if left not in fire_id_to_index or right not in fire_id_to_index:
+                continue
+            pi = len(pairs)
+            pairs.append(
+                FirePair(
+                    pair_id=f[col["pair_id"]],
+                    chrom=f[col["chrom"]],
+                    left_fire_id=left,
+                    right_fire_id=right,
+                    gap_bp=int(f[col["gap_bp"]]),
+                )
+            )
+            lookup[(fire_id_to_index[left], fire_id_to_index[right])] = pi
+    return pairs, lookup
+
+
+def parse_b_array(value: str) -> List[int]:
+    # SAM representation is TYPE,v1,v2,... e.g. I,12,30 or C,255,200
+    if not value:
+        return []
+    parts = value.split(",")
+    if len(parts) <= 1:
+        return []
+    try:
+        return [int(x) for x in parts[1:] if x != ""]
+    except ValueError:
+        return []
+
+
+def parse_optional_tags(fields: Sequence[str], wanted: set[str]) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for item in fields:
+        if len(item) < 5 or item[2] != ":":
+            continue
+        tag = item[:2]
+        if tag not in wanted:
+            continue
+        try:
+            _, _, value = item.split(":", 2)
+        except ValueError:
+            continue
+        out[tag] = value
+    return out
+
+
+def parse_cigar(cigar: str, ref_start: int) -> Tuple[List[Tuple[int, int, int, int]], int, int, bool]:
+    """Return matched blocks, reference end, query-consumed length, hard-clip flag."""
+    q = 0
+    r = ref_start
+    blocks: List[Tuple[int, int, int, int]] = []
+    hard_clip = False
+    consumed = 0
+    for m in CIGAR_RE.finditer(cigar):
+        n = int(m.group(1))
+        op = m.group(2)
+        consumed += len(m.group(0))
+        if op in ("M", "=", "X"):
+            blocks.append((r, r + n, q, q + n))
+            r += n
+            q += n
+        elif op in ("I", "S"):
+            q += n
+        elif op in ("D", "N"):
+            r += n
+        elif op == "H":
+            hard_clip = True
+        elif op == "P":
+            pass
+    if consumed != len(cigar):
+        raise ValueError(f"Could not parse CIGAR {cigar}")
+    return blocks, r, q, hard_clip
+
+
+class AlignmentMap:
+    __slots__ = ("blocks", "ref_starts", "query_starts")
+
+    def __init__(self, blocks: Sequence[Tuple[int, int, int, int]]):
+        self.blocks = list(blocks)
+        self.ref_starts = [b[0] for b in blocks]
+        self.query_starts = [b[2] for b in blocks]
+
+    def ref_to_query(self, ref_pos: int) -> Optional[int]:
+        i = bisect.bisect_right(self.ref_starts, ref_pos) - 1
+        if i < 0:
+            return None
+        rs, re_, qs, _ = self.blocks[i]
+        if ref_pos >= re_:
+            return None
+        return qs + (ref_pos - rs)
+
+    def query_to_ref(self, query_pos: int) -> Optional[int]:
+        i = bisect.bisect_right(self.query_starts, query_pos) - 1
+        if i < 0:
+            return None
+        rs, _, qs, qe = self.blocks[i]
+        if query_pos >= qe:
+            return None
+        return rs + (query_pos - qs)
+
+
+def query_to_molecular(query_pos: int, read_len: int, reverse: bool) -> int:
+    return query_pos if not reverse else read_len - 1 - query_pos
+
+
+def molecular_to_query(mol_pos: int, read_len: int, reverse: bool) -> int:
+    return mol_pos if not reverse else read_len - 1 - mol_pos
+
+
+def containing_interval(starts: Sequence[int], lengths: Sequence[int], pos: int) -> Tuple[int, int]:
+    if not starts:
+        return -1, 0
+    i = bisect.bisect_right(starts, pos) - 1
+    if i >= 0 and i < len(lengths) and starts[i] <= pos < starts[i] + lengths[i]:
+        return i, lengths[i]
+    return -1, 0
+
+
+def nearest_nucleosome_offsets(
+    mol_pos: int,
+    fire_center: int,
+    nuc_starts: Sequence[int],
+    nuc_lengths: Sequence[int],
+    amap: AlignmentMap,
+    read_len: int,
+    reverse: bool,
+) -> Tuple[Optional[int], Optional[int], Optional[int]]:
+    """Return upstream, downstream and containing nucleosome-center offsets."""
+    if not nuc_starts:
+        return None, None, None
+    i = bisect.bisect_right(nuc_starts, mol_pos)
+    candidates = range(max(0, i - 4), min(len(nuc_starts), i + 4))
+    upstream: Optional[int] = None
+    downstream: Optional[int] = None
+    containing: Optional[int] = None
+    for j in candidates:
+        ns = nuc_starts[j]
+        nl = nuc_lengths[j]
+        nc = ns + nl // 2
+        q = molecular_to_query(nc, read_len, reverse)
+        rp = amap.query_to_ref(q)
+        if rp is None:
+            continue
+        offset = rp - fire_center
+        if ns <= mol_pos < ns + nl:
+            if containing is None or abs(offset) < abs(containing):
+                containing = offset
+        if offset < 0 and (upstream is None or offset > upstream):
+            upstream = offset
+        elif offset > 0 and (downstream is None or offset < downstream):
+            downstream = offset
+    return upstream, downstream, containing
+
+
+def make_u64(n: int) -> array:
+    return array("Q", [0]) * n
+
+
+def make_f64(n: int) -> array:
+    return array("d", [0.0]) * n
+
+
+def update_sum(arr_count: array, arr_sum: array, arr_sumsq: array, idx: int, value: Optional[int]) -> None:
+    if value is None:
+        return
+    arr_count[idx] += 1
+    arr_sum[idx] += float(value)
+    arr_sumsq[idx] += float(value) * float(value)
+
+
+def mean_sd(n: int, s: float, ss: float) -> Tuple[str, str]:
+    if n <= 0:
+        return "NA", "NA"
+    mean = s / n
+    if n == 1:
+        return f"{mean:.8g}", "NA"
+    var = max(0.0, (ss - (s * s) / n) / (n - 1))
+    return f"{mean:.8g}", f"{math.sqrt(var):.8g}"
+
+
+def count_mm_calls(mm_value: str) -> Dict[str, Tuple[int, str, List[int]]]:
+    """Return modification group -> call count, skip flag, delta list."""
+    out: Dict[str, Tuple[int, str, List[int]]] = {}
+    for group in mm_value.rstrip(";").split(";"):
+        if not group:
+            continue
+        m = MM_GROUP_RE.match(group)
+        if not m:
+            continue
+        base, strand, mod, skip_flag, delta_text = m.groups()
+        deltas: List[int] = []
+        if delta_text:
+            try:
+                deltas = [int(x) for x in delta_text.split(",") if x != ""]
+            except ValueError:
+                deltas = []
+        out[f"{base}{strand}{mod}"] = (len(deltas), skip_flag, deltas)
+    return out
+
+
+def decode_group_positions(sequence: str, canonical_base: str, deltas: Sequence[int]) -> List[int]:
+    positions: List[int] = []
+    cursor = -1
+    search_from = 0
+    # Delta values count unmodified occurrences of the canonical base before the next call.
+    for delta in deltas:
+        for _ in range(delta + 1):
+            cursor = sequence.find(canonical_base, search_from)
+            if cursor < 0:
+                return positions
+            search_from = cursor + 1
+        positions.append(cursor)
+    return positions
+
+
+def write_fire_output(
+    path: str,
+    sample: str,
+    fires: Sequence[FireRegion],
+    metrics: Dict[str, array],
+) -> None:
+    header = [
+        "sample", "fire_id", "chrom", "start", "end", "width", "pooled_direction", "pooled_fdr",
+        "spanning_fibers", "open_fibers", "closed_fibers", "unresolved_fibers", "informative_fibers",
+        "molecular_actuation_probability", "mean_open_msp_length", "mean_closed_nucleosome_length",
+        "open_upstream_nucleosome_n", "open_upstream_nucleosome_mean_offset", "open_upstream_nucleosome_sd_offset",
+        "open_downstream_nucleosome_n", "open_downstream_nucleosome_mean_offset", "open_downstream_nucleosome_sd_offset",
+        "closed_containing_nucleosome_n", "closed_containing_nucleosome_mean_offset", "closed_containing_nucleosome_sd_offset",
+        "closed_upstream_nucleosome_n", "closed_upstream_nucleosome_mean_offset", "closed_upstream_nucleosome_sd_offset",
+        "closed_downstream_nucleosome_n", "closed_downstream_nucleosome_mean_offset", "closed_downstream_nucleosome_sd_offset",
+    ]
+    with gzip.open(path, "wt", newline="") as out:
+        out.write("\t".join(header) + "\n")
+        for i, fire in enumerate(fires):
+            span = metrics["span"][i]
+            if span == 0:
+                continue
+            opn = metrics["open"][i]
+            cls = metrics["closed"][i]
+            unr = metrics["unresolved"][i]
+            inf = opn + cls
+            act = "NA" if inf == 0 else f"{opn / inf:.10g}"
+            mean_msp = "NA" if opn == 0 else f"{metrics['open_msp_len_sum'][i] / opn:.8g}"
+            mean_nuc = "NA" if cls == 0 else f"{metrics['closed_nuc_len_sum'][i] / cls:.8g}"
+            ou_m, ou_sd = mean_sd(metrics["ou_n"][i], metrics["ou_sum"][i], metrics["ou_ss"][i])
+            od_m, od_sd = mean_sd(metrics["od_n"][i], metrics["od_sum"][i], metrics["od_ss"][i])
+            cc_m, cc_sd = mean_sd(metrics["cc_n"][i], metrics["cc_sum"][i], metrics["cc_ss"][i])
+            cu_m, cu_sd = mean_sd(metrics["cu_n"][i], metrics["cu_sum"][i], metrics["cu_ss"][i])
+            cd_m, cd_sd = mean_sd(metrics["cd_n"][i], metrics["cd_sum"][i], metrics["cd_ss"][i])
+            row = [
+                sample, fire.fire_id, fire.chrom, str(fire.start), str(fire.end), str(fire.width),
+                fire.pooled_direction, f"{fire.pooled_fdr:.10g}", str(span), str(opn), str(cls), str(unr), str(inf), act,
+                mean_msp, mean_nuc,
+                str(metrics["ou_n"][i]), ou_m, ou_sd,
+                str(metrics["od_n"][i]), od_m, od_sd,
+                str(metrics["cc_n"][i]), cc_m, cc_sd,
+                str(metrics["cu_n"][i]), cu_m, cu_sd,
+                str(metrics["cd_n"][i]), cd_m, cd_sd,
+            ]
+            out.write("\t".join(row) + "\n")
+
+
+def write_pair_output(
+    path: str,
+    sample: str,
+    pairs: Sequence[FirePair],
+    pair_metrics: Dict[str, array],
+) -> None:
+    header = [
+        "sample", "pair_id", "chrom", "left_fire_id", "right_fire_id", "gap_bp",
+        "spanning_fibers", "both_open", "left_open_right_closed", "left_closed_right_open", "both_closed",
+        "unresolved", "informative_fibers", "observed_both_open", "expected_both_open_independence",
+        "coactuation_ratio", "coactuation_log2_ratio",
+    ]
+    with gzip.open(path, "wt", newline="") as out:
+        out.write("\t".join(header) + "\n")
+        for i, pair in enumerate(pairs):
+            span = pair_metrics["span"][i]
+            if span == 0:
+                continue
+            oo = pair_metrics["oo"][i]
+            oc = pair_metrics["oc"][i]
+            co = pair_metrics["co"][i]
+            cc = pair_metrics["cc"][i]
+            unr = pair_metrics["unresolved"][i]
+            inf = oo + oc + co + cc
+            if inf > 0:
+                obs = oo / inf
+                p_left = (oo + oc) / inf
+                p_right = (oo + co) / inf
+                exp = p_left * p_right
+                ratio = obs / exp if exp > 0 else math.nan
+                log2r = math.log2(ratio) if ratio > 0 else math.nan
+                vals = [f"{obs:.10g}", f"{exp:.10g}", "NA" if math.isnan(ratio) else f"{ratio:.10g}", "NA" if math.isnan(log2r) else f"{log2r:.10g}"]
+            else:
+                vals = ["NA", "NA", "NA", "NA"]
+            row = [sample, pair.pair_id, pair.chrom, pair.left_fire_id, pair.right_fire_id, str(pair.gap_bp),
+                   str(span), str(oo), str(oc), str(co), str(cc), str(unr), str(inf)] + vals
+            out.write("\t".join(row) + "\n")
+
+
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--fires", required=True)
+    ap.add_argument("--pairs", required=True)
+    ap.add_argument("--sample", required=True)
+    ap.add_argument("--condition", required=True)
+    ap.add_argument("--clone-pair", required=True)
+    ap.add_argument("--output-dir", required=True)
+    ap.add_argument("--progress-every", type=int, default=10000)
+    args = ap.parse_args()
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    print(f"[{args.sample}] loading consensus FIRE regions", file=sys.stderr, flush=True)
+    fires, chrom_indices, fire_id_to_index = load_fires(args.fires)
+    print(f"[{args.sample}] loading adjacent FIRE pairs", file=sys.stderr, flush=True)
+    pairs, pair_lookup = load_pairs(args.pairs, fire_id_to_index)
+    nfire = len(fires)
+    npair = len(pairs)
+    print(f"[{args.sample}] loaded {nfire:,} FIRE regions and {npair:,} pairs", file=sys.stderr, flush=True)
+
+    metrics: Dict[str, array] = {
+        "span": make_u64(nfire), "open": make_u64(nfire), "closed": make_u64(nfire), "unresolved": make_u64(nfire),
+        "open_msp_len_sum": make_u64(nfire), "closed_nuc_len_sum": make_u64(nfire),
+        "ou_n": make_u64(nfire), "ou_sum": make_f64(nfire), "ou_ss": make_f64(nfire),
+        "od_n": make_u64(nfire), "od_sum": make_f64(nfire), "od_ss": make_f64(nfire),
+        "cc_n": make_u64(nfire), "cc_sum": make_f64(nfire), "cc_ss": make_f64(nfire),
+        "cu_n": make_u64(nfire), "cu_sum": make_f64(nfire), "cu_ss": make_f64(nfire),
+        "cd_n": make_u64(nfire), "cd_sum": make_f64(nfire), "cd_ss": make_f64(nfire),
+    }
+    pair_metrics: Dict[str, array] = {
+        "span": make_u64(npair), "oo": make_u64(npair), "oc": make_u64(npair),
+        "co": make_u64(npair), "cc": make_u64(npair), "unresolved": make_u64(npair),
+    }
+
+    qc = {
+        "records_read": 0,
+        "records_with_candidate_fire": 0,
+        "hard_clipped_records_skipped": 0,
+        "missing_core_tags_records": 0,
+        "cigar_query_length_mismatch_records": 0,
+        "fire_spans": 0,
+        "fire_center_mapping_failures": 0,
+        "pair_spans": 0,
+    }
+
+    start_time = time.time()
+    next_progress = args.progress_every if args.progress_every > 0 else 0
+
+    for line in sys.stdin:
+        if not line.strip():
+            continue
+        fields = line.rstrip("\n").split("\t")
+        if len(fields) != 9:
+            continue
+        flag_s, chrom, pos_s, cigar, read_len_s, as_value, al_value, ns_value, nl_value = fields
+        qc["records_read"] += 1
+
+        if next_progress and qc["records_read"] >= next_progress:
+            elapsed = time.time() - start_time
+            rate = qc["records_read"] / elapsed if elapsed > 0 else 0.0
+            print(
+                f"[{args.sample}] {qc['records_read']:,} compact records, {qc['fire_spans']:,} FIRE spans, {rate:,.1f} records per second",
+                file=sys.stderr,
+                flush=True,
+            )
+            next_progress += args.progress_every
+
+        if chrom not in chrom_indices or cigar == "*":
+            continue
+
+        flag = int(flag_s)
+        reverse = bool(flag & 16)
+        ref_start = int(pos_s) - 1
+        read_len = int(read_len_s)
+
+        try:
+            blocks, ref_end, q_consumed, hard_clip = parse_cigar(cigar, ref_start)
+        except Exception:
+            qc["cigar_query_length_mismatch_records"] += 1
+            continue
+        if hard_clip:
+            qc["hard_clipped_records_skipped"] += 1
+            continue
+        if q_consumed != read_len:
+            qc["cigar_query_length_mismatch_records"] += 1
+            continue
+
+        candidates = chrom_indices[chrom].fully_spanned(ref_start, ref_end)
+        if not candidates:
+            continue
+
+        qc["records_with_candidate_fire"] += 1
+        msp_starts = parse_b_array(as_value)
+        msp_lengths = parse_b_array(al_value)
+        nuc_starts = parse_b_array(ns_value)
+        nuc_lengths = parse_b_array(nl_value)
+        if (
+            len(msp_starts) != len(msp_lengths)
+            or len(nuc_starts) != len(nuc_lengths)
+            or not as_value
+            or not al_value
+            or not ns_value
+            or not nl_value
+        ):
+            qc["missing_core_tags_records"] += 1
+            continue
+
+        amap = AlignmentMap(blocks)
+        candidate_states: List[Tuple[int, str]] = []
+
+        for _, fire, gi in candidates:
+            metrics["span"][gi] += 1
+            qc["fire_spans"] += 1
+            center = (fire.start + fire.end) // 2
+            q_center = amap.ref_to_query(center)
+            if q_center is None:
+                metrics["unresolved"][gi] += 1
+                qc["fire_center_mapping_failures"] += 1
+                candidate_states.append((gi, "U"))
+                continue
+
+            m_center = query_to_molecular(q_center, read_len, reverse)
+            mi, mlen = containing_interval(msp_starts, msp_lengths, m_center)
+            ni, nlen = containing_interval(nuc_starts, nuc_lengths, m_center)
+            if mi >= 0:
+                state = "O"
+                metrics["open"][gi] += 1
+                metrics["open_msp_len_sum"][gi] += mlen
+            elif ni >= 0:
+                state = "C"
+                metrics["closed"][gi] += 1
+                metrics["closed_nuc_len_sum"][gi] += nlen
+            else:
+                state = "U"
+                metrics["unresolved"][gi] += 1
+            candidate_states.append((gi, state))
+
+            if state in ("O", "C"):
+                up, down, containing = nearest_nucleosome_offsets(
+                    m_center, center, nuc_starts, nuc_lengths, amap, read_len, reverse
+                )
+                if state == "O":
+                    update_sum(metrics["ou_n"], metrics["ou_sum"], metrics["ou_ss"], gi, up)
+                    update_sum(metrics["od_n"], metrics["od_sum"], metrics["od_ss"], gi, down)
+                else:
+                    update_sum(metrics["cc_n"], metrics["cc_sum"], metrics["cc_ss"], gi, containing)
+                    update_sum(metrics["cu_n"], metrics["cu_sum"], metrics["cu_ss"], gi, up)
+                    update_sum(metrics["cd_n"], metrics["cd_sum"], metrics["cd_ss"], gi, down)
+
+        if len(candidate_states) >= 2:
+            state_map = {gi: state for gi, state in candidate_states}
+            sorted_gi = sorted(state_map)
+            for left, right in zip(sorted_gi[:-1], sorted_gi[1:]):
+                pi = pair_lookup.get((left, right))
+                if pi is None:
+                    continue
+                pair_metrics["span"][pi] += 1
+                qc["pair_spans"] += 1
+                ls, rs = state_map[left], state_map[right]
+                if ls == "O" and rs == "O":
+                    pair_metrics["oo"][pi] += 1
+                elif ls == "O" and rs == "C":
+                    pair_metrics["oc"][pi] += 1
+                elif ls == "C" and rs == "O":
+                    pair_metrics["co"][pi] += 1
+                elif ls == "C" and rs == "C":
+                    pair_metrics["cc"][pi] += 1
+                else:
+                    pair_metrics["unresolved"][pi] += 1
+
+    fire_out = os.path.join(args.output_dir, f"{args.sample}.fire_molecular_states.tsv.gz")
+    pair_out = os.path.join(args.output_dir, f"{args.sample}.adjacent_fire_coactuation.tsv.gz")
+    qc_out = os.path.join(args.output_dir, f"{args.sample}.processing_qc.tsv")
+
+    print(f"[{args.sample}] writing FIRE output", file=sys.stderr, flush=True)
+    write_fire_output(fire_out, args.sample, fires, metrics)
+    print(f"[{args.sample}] writing pair output", file=sys.stderr, flush=True)
+    write_pair_output(pair_out, args.sample, pairs, pair_metrics)
+
+    elapsed = time.time() - start_time
+    with open(qc_out, "wt", newline="") as out:
+        out.write("sample\tcondition\tclone_pair\tmetric\tvalue\n")
+        for key, value in qc.items():
+            out.write(f"{args.sample}\t{args.condition}\t{args.clone_pair}\t{key}\t{value}\n")
+        out.write(f"{args.sample}\t{args.condition}\t{args.clone_pair}\telapsed_seconds\t{elapsed:.3f}\n")
+        out.write(f"{args.sample}\t{args.condition}\t{args.clone_pair}\trecords_per_second\t{qc['records_read']/elapsed if elapsed else 0:.3f}\n")
+
+    print(f"[{args.sample}] completed in {elapsed/60:.2f} minutes", file=sys.stderr, flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
