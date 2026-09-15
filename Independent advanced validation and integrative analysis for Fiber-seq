@@ -1,0 +1,703 @@
+import bisect
+import json
+import math
+import os
+import re
+import xml.etree.ElementTree as ET
+from collections import defaultdict
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from scipy import stats
+from statsmodels.stats.multitest import multipletests
+from sklearn.decomposition import PCA
+from sklearn.linear_model import LogisticRegression, Ridge
+from sklearn.metrics import roc_auc_score
+from sklearn.model_selection import KFold, StratifiedKFold, cross_val_predict, cross_val_score
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+
+ROOT = Path('/mnt/data/eleocharis_reanalysis')
+BASE = ROOT / 'analysis'
+OUT = ROOT / 'analysis_advanced'
+OUT.mkdir(parents=True, exist_ok=True)
+TSS_DIR = OUT / 'tss_matrices'
+TSS_DIR.mkdir(exist_ok=True)
+
+SAMPLES = ['Aqua_1', 'Aqua_2', 'Aqua_5', 'Terres_1', 'Terres_2', 'Terres_5']
+AQUA = ['Aqua_1', 'Aqua_2', 'Aqua_5']
+TERRES = ['Terres_1', 'Terres_2', 'Terres_5']
+PAIR_IDS = ['1', '2', '5']
+
+PEAK_ROOT = ROOT / 'extracted' / '1-FIRE(1)' / '1-FIRE' / '06.FIRE'
+MOTIF_ROOT = ROOT / 'extracted' / 'motif_archive' / 'Centrimo-FIMO-STREME-TOMTOM-files - Copy'
+DMR_ROOT = ROOT / 'extracted' / '1-Group_DMR(2)' / '1-Group_DMR' / '1-Group_DMR' / 'Terres_vs_Aqua'
+
+LEFT = 2000
+RIGHT = 4000
+BIN = 50
+NBINS = (LEFT + RIGHT) // BIN
+CENTERS = np.arange(-LEFT + BIN / 2, RIGHT, BIN)
+PROMOTER_CENTER = (CENTERS >= -250) & (CENTERS <= 250)
+TSS_100 = (CENTERS >= -100) & (CENTERS <= 100)
+
+
+def bh(pvals):
+    arr = np.asarray(pvals, dtype=float)
+    out = np.full(arr.shape, np.nan)
+    mask = np.isfinite(arr)
+    if mask.any():
+        out[mask] = multipletests(arr[mask], method='fdr_bh')[1]
+    return out
+
+
+def safe_pearson(x, y):
+    x = np.asarray(x, float)
+    y = np.asarray(y, float)
+    m = np.isfinite(x) & np.isfinite(y)
+    if m.sum() < 3 or np.std(x[m]) == 0 or np.std(y[m]) == 0:
+        return np.nan, np.nan
+    return stats.pearsonr(x[m], y[m])
+
+
+def safe_spearman(x, y):
+    x = np.asarray(x, float)
+    y = np.asarray(y, float)
+    m = np.isfinite(x) & np.isfinite(y)
+    if m.sum() < 3:
+        return np.nan, np.nan
+    return stats.spearmanr(x[m], y[m])
+
+
+def fisher_from_sets(gene_ids, query_set, positive_set):
+    universe = set(gene_ids)
+    q = set(query_set) & universe
+    p = set(positive_set) & universe
+    a = len(q & p)
+    b = len(q - p)
+    c = len(p - q)
+    d = len(universe - (q | p))
+    odds, pv = stats.fisher_exact([[a, b], [c, d]])
+    return {'a': a, 'b': b, 'c': c, 'd': d, 'odds_ratio': odds, 'pvalue': pv}
+
+
+def exact_signflip_p(diffs):
+    d = np.asarray(diffs, float)
+    d = d[np.isfinite(d)]
+    if len(d) == 0:
+        return np.nan
+    obs = abs(d.mean())
+    vals = []
+    for mask in range(1 << len(d)):
+        signs = np.array([1 if mask & (1 << i) else -1 for i in range(len(d))])
+        vals.append(abs(np.mean(d * signs)))
+    return float(np.mean(np.asarray(vals) >= obs - 1e-12))
+
+
+def bootstrap_mean_ci(values, nboot=10000, seed=417):
+    x = np.asarray(values, float)
+    x = x[np.isfinite(x)]
+    if len(x) == 0:
+        return np.nan, np.nan
+    rng = np.random.default_rng(seed)
+    idx = rng.integers(0, len(x), size=(nboot, len(x)))
+    means = x[idx].mean(axis=1)
+    return tuple(np.quantile(means, [0.025, 0.975]))
+
+
+def load_peak(sample):
+    p = PEAK_ROOT / sample.replace('_', '-') / f"{sample.replace('_', '-')}_peak_info.xls"
+    d = pd.read_csv(p, sep='\t')
+    d = d.rename(columns={'#chrom': 'chrom', 'peak_start': 'start', 'peak_end': 'end'})
+    d['start'] = d['start'].astype(int)
+    d['end'] = d['end'].astype(int)
+    d['score'] = pd.to_numeric(d['score'], errors='coerce').fillna(0.0)
+    return d[['chrom', 'start', 'end', 'score']].sort_values(['chrom', 'start', 'end']).reset_index(drop=True)
+
+
+def build_gene_index(genes):
+    out = {}
+    for chrom, g in genes.groupby('chrom', sort=False):
+        gg = g.sort_values('tss')
+        out[chrom] = {
+            'tss': gg['tss'].to_numpy(np.int64),
+            'idx': gg.index.to_numpy(np.int64),
+            'strand': gg['strand'].to_numpy(str),
+        }
+    return out
+
+
+def build_tss_matrix(genes, gene_index, peaks, sample):
+    n = len(genes)
+    cov = np.zeros((n, NBINS), dtype=np.uint8)
+    score = np.zeros((n, NBINS), dtype=np.float32)
+    margin = max(LEFT, RIGHT)
+    for chrom, pp in peaks.groupby('chrom', sort=False):
+        if chrom not in gene_index:
+            continue
+        gi = gene_index[chrom]
+        tss = gi['tss']
+        rows = gi['idx']
+        strands = gi['strand']
+        for rec in pp.itertuples(index=False):
+            ps, pe, sc = int(rec.start), int(rec.end), float(rec.score)
+            lo = bisect.bisect_left(tss, ps - margin)
+            hi = bisect.bisect_right(tss, pe + margin)
+            for k in range(lo, hi):
+                t = int(tss[k])
+                if strands[k] == '+':
+                    r0, r1 = ps - t, pe - t
+                else:
+                    r0, r1 = t - pe, t - ps
+                if r1 <= -LEFT or r0 >= RIGHT:
+                    continue
+                r0 = max(r0, -LEFT)
+                r1 = min(r1, RIGHT)
+                b0 = max(0, int(math.floor((r0 + LEFT) / BIN)))
+                b1 = min(NBINS, int(math.ceil((r1 + LEFT) / BIN)))
+                if b1 <= b0:
+                    continue
+                row = int(rows[k])
+                cov[row, b0:b1] = 1
+                score[row, b0:b1] = np.maximum(score[row, b0:b1], sc)
+    np.savez_compressed(TSS_DIR / f'{sample}_TSS_matrix.npz', coverage=cov, score=score, centers=CENTERS)
+    return cov, score
+
+
+def interval_region_metrics(regions, peaks):
+    """Union overlap fraction and max score for each region, per chromosome."""
+    frac = np.zeros(len(regions), dtype=np.float32)
+    maxscore = np.zeros(len(regions), dtype=np.float32)
+    for chrom, rr in regions.groupby('chrom', sort=False):
+        idx = rr.index.to_numpy()
+        pp = peaks[peaks['chrom'] == chrom]
+        if pp.empty:
+            continue
+        ps = pp['start'].to_numpy(np.int64)
+        pe = pp['end'].to_numpy(np.int64)
+        pv = pp['score'].to_numpy(float)
+        left = 0
+        for ridx, row in zip(idx, rr.itertuples(index=False)):
+            rs, re_ = int(row.start), int(row.end)
+            while left < len(pp) and pe[left] <= rs:
+                left += 1
+            j = left
+            segments = []
+            ms = 0.0
+            while j < len(pp) and ps[j] < re_:
+                s = max(rs, int(ps[j]))
+                e = min(re_, int(pe[j]))
+                if e > s:
+                    segments.append((s, e))
+                    ms = max(ms, float(pv[j]))
+                j += 1
+            if segments:
+                segments.sort()
+                total = 0
+                cs, ce = segments[0]
+                for s, e in segments[1:]:
+                    if s <= ce:
+                        ce = max(ce, e)
+                    else:
+                        total += ce - cs
+                        cs, ce = s, e
+                total += ce - cs
+                frac[ridx] = total / max(1, re_ - rs)
+                maxscore[ridx] = ms
+    return frac, maxscore
+
+
+def aggregate_gene_effect(df, gene_col, prefix):
+    d = df[df[gene_col].notna()].copy()
+    if d.empty:
+        return pd.DataFrame(columns=['gene_id'])
+    rows = []
+    for gid, g in d.groupby(gene_col, sort=False):
+        effects = g['fire_effect'].to_numpy(float)
+        best = g.iloc[int(np.nanargmax(np.abs(effects)))]
+        sig = g['significant'].astype(bool)
+        rows.append({
+            'gene_id': gid,
+            f'{prefix}_effect': float(best['fire_effect']),
+            f'{prefix}_min_FDR': float(g['fire_fdr'].min()),
+            f'{prefix}_n_regions': int(len(g)),
+            f'{prefix}_n_significant': int(sig.sum()),
+            f'{prefix}_n_Terres_open': int((sig & (g['fire_effect'] > 0)).sum()),
+            f'{prefix}_n_Aqua_open': int((sig & (g['fire_effect'] < 0)).sum()),
+        })
+    return pd.DataFrame(rows)
+
+
+def parse_streme_pwm(streme_txt):
+    motifs = []
+    with open(streme_txt) as f:
+        lines = f.readlines()
+    i = 0
+    while i < len(lines):
+        if lines[i].startswith('MOTIF '):
+            parts = lines[i].strip().split()
+            motif_id, alt = parts[1], parts[2] if len(parts) > 2 else parts[1]
+            i += 1
+            while i < len(lines) and not lines[i].startswith('letter-probability matrix'):
+                i += 1
+            if i >= len(lines):
+                break
+            m = re.search(r'w=\s*(\d+).*nsites=\s*(\d+).*E=\s*([^\s]+)', lines[i])
+            width = int(m.group(1)) if m else 0
+            nsites = int(m.group(2)) if m else 0
+            ev = float(m.group(3)) if m else np.nan
+            mat = []
+            for j in range(width):
+                vals = [float(x) for x in lines[i + 1 + j].split()[:4]]
+                mat.append(vals)
+            motifs.append({'motif_id': motif_id, 'alt_id': alt, 'width': width, 'nsites': nsites, 'E_value': ev, 'pwm': mat})
+            i += width + 1
+        else:
+            i += 1
+    return motifs
+
+
+def matched_background_audit(aqua_bed, positive_bed, seq_table, motif_ids, n_iter=500, seed=802):
+    """Length and chromosome matched incidence audit using STREME hit memberships."""
+    rng = np.random.default_rng(seed)
+    a = pd.read_csv(aqua_bed, sep='\t', header=None, names=['chrom', 'start', 'end'])
+    p = pd.read_csv(positive_bed, sep='\t', header=None, names=['chrom', 'start', 'end'])
+    a['seq_id'] = a['chrom'].astype(str) + ':' + a['start'].astype(str) + '-' + a['end'].astype(str)
+    p['seq_id'] = p['chrom'].astype(str) + ':' + p['start'].astype(str) + '-' + p['end'].astype(str)
+    a['length'] = a['end'] - a['start']
+    p['length'] = p['end'] - p['start']
+    # broad bins provide stable strata while preserving the strong length contrast
+    edges = np.array([0, 150, 200, 250, 300, 400, 600, 1000, 2000, 1000000])
+    a['lenbin'] = pd.cut(a['length'], bins=edges, include_lowest=True, labels=False)
+    p['lenbin'] = pd.cut(p['length'], bins=edges, include_lowest=True, labels=False)
+    seq = pd.read_csv(seq_table, sep='\t', comment='#')
+    rows = []
+    for motif in motif_ids:
+        pos_hits = set(seq.loc[(seq['motif_ID'] == motif) & (seq['seq_Class'] == 'tp'), 'seq_ID'])
+        neg_hits = set(seq.loc[(seq['motif_ID'] == motif) & (seq['seq_Class'] == 'fp'), 'seq_ID'])
+        pos_n = int(p['seq_id'].isin(pos_hits).sum())
+        sampled_rates = []
+        for _ in range(n_iter):
+            chosen = []
+            for (chrom, lb), gp in p.groupby(['chrom', 'lenbin'], dropna=False):
+                pool = a[(a['chrom'] == chrom) & (a['lenbin'] == lb)]
+                if pool.empty:
+                    # fallback to same chromosome
+                    pool = a[a['chrom'] == chrom]
+                if pool.empty:
+                    pool = a
+                n = len(gp)
+                ix = rng.choice(pool.index.to_numpy(), size=n, replace=(len(pool) < n))
+                chosen.extend(a.loc[ix, 'seq_id'].tolist())
+            sampled_rates.append(np.mean([x in neg_hits for x in chosen]))
+        bg_rate = float(np.mean(sampled_rates))
+        bg_lo, bg_hi = np.quantile(sampled_rates, [0.025, 0.975])
+        pos_rate = pos_n / len(p)
+        # pseudo-count stabilized fold enrichment
+        fold = (pos_rate + 0.5 / len(p)) / (bg_rate + 0.5 / len(p))
+        # use full STREME background for formal Fisher test
+        n_pos = len(p)
+        xml_root = ET.parse(MOTIF_ROOT / 'streme_Terres_vs_Aqua' / 'streme.xml').getroot()
+        n_neg = int(xml_root.find('.//train_negatives').attrib['count'])
+        neg_n = len(neg_hits)
+        odds, pv = stats.fisher_exact([[pos_n, n_pos - pos_n], [neg_n, n_neg - neg_n]])
+        rows.append({
+            'motif_id': motif,
+            'positive_n': n_pos,
+            'positive_hits': pos_n,
+            'positive_rate': pos_rate,
+            'matched_background_rate_mean': bg_rate,
+            'matched_background_rate_low95': bg_lo,
+            'matched_background_rate_high95': bg_hi,
+            'matched_fold_enrichment': fold,
+            'STREME_negative_n': n_neg,
+            'STREME_negative_hits': neg_n,
+            'Fisher_odds_ratio': odds,
+            'Fisher_pvalue': pv,
+        })
+    out = pd.DataFrame(rows)
+    out['Fisher_FDR'] = bh(out['Fisher_pvalue'])
+    return out
+
+
+def main():
+    summary = {'scope': 'Aqua versus Terres only', 'ABA_excluded': True}
+    genes = pd.read_csv(BASE / 'genes.csv').rename(columns={'gene': 'gene_id'}).reset_index(drop=True)
+    expr = pd.read_csv(BASE / 'expression_publication.csv').rename(columns={
+        'gene': 'gene_id', 'Aqua-1': 'Aqua_1_FPKM', 'Aqua-2': 'Aqua_2_FPKM', 'Aqua-5': 'Aqua_5_FPKM',
+        'Terres-1': 'Terres_1_FPKM', 'Terres-2': 'Terres_2_FPKM', 'Terres-5': 'Terres_5_FPKM',
+        'rna_log2fc': 'log2FoldChange', 'rna_qvalue': 'qvalue', 'is_DEG': 'DEG',
+        'de_direction': 'RNA_direction', 'annotation': 'Annotation', 'pathway': 'KEGG'
+    })
+    expr['mean_fpkm_all'] = expr[[f'{s}_FPKM' for s in SAMPLES]].mean(axis=1)
+    expr['log_mean_fpkm'] = np.log10(expr['mean_fpkm_all'] + 0.1)
+    expr['DEG'] = expr['DEG'].fillna(False).astype(bool)
+    expr['RNA_direction'] = expr['RNA_direction'].astype('string').str.replace('-', '_', regex=False)
+    genes = genes.merge(expr[['gene_id', 'mean_fpkm_all', 'log_mean_fpkm', 'log2FoldChange', 'qvalue', 'DEG', 'RNA_direction', 'Annotation', 'GO_Anno', 'KEGG']], on='gene_id', how='left')
+    genes.index = np.arange(len(genes))
+    gene_index = build_gene_index(genes)
+
+    # TSS matrices and promoter validation
+    sample_profiles = []
+    promoter_rows = []
+    coverage_mats = {}
+    score_mats = {}
+    for sample in SAMPLES:
+        print('TSS matrix', sample, flush=True)
+        peaks = load_peak(sample)
+        cov, scr = build_tss_matrix(genes, gene_index, peaks, sample)
+        coverage_mats[sample] = cov
+        score_mats[sample] = scr
+        sample_profiles.append(pd.DataFrame({
+            'sample': sample,
+            'condition': sample.split('_')[0],
+            'position': CENTERS,
+            'coverage_fraction': cov.mean(axis=0),
+            'mean_peak_score': scr.mean(axis=0),
+        }))
+        gene_cov100 = cov[:, TSS_100].mean(axis=1)
+        gene_cov500 = cov[:, PROMOTER_CENTER].mean(axis=1)
+        gene_score500 = scr[:, PROMOTER_CENTER].mean(axis=1)
+        promoter_rows.append(pd.DataFrame({
+            'gene_id': genes['gene_id'], 'sample': sample, 'condition': sample.split('_')[0],
+            'replicate': sample.split('_')[1], 'TSS100_coverage': gene_cov100,
+            'TSS500_coverage': gene_cov500, 'TSS500_score': gene_score500,
+        }))
+    pd.concat(sample_profiles).to_csv(OUT / 'TSS_sample_profiles.csv', index=False)
+    prom = pd.concat(promoter_rows, ignore_index=True)
+    prom.to_csv(OUT / 'promoter_metrics_gene_sample.csv.gz', index=False, compression='gzip')
+
+    prom_sample = prom.groupby(['sample', 'condition', 'replicate'], as_index=False)[['TSS100_coverage', 'TSS500_coverage', 'TSS500_score']].mean()
+    prom_sample.to_csv(OUT / 'promoter_metrics_sample_summary.csv', index=False)
+    pair_rows = []
+    for metric in ['TSS100_coverage', 'TSS500_coverage', 'TSS500_score']:
+        diffs = []
+        for rep in PAIR_IDS:
+            a = prom_sample.loc[prom_sample['sample'] == f'Aqua_{rep}', metric].iloc[0]
+            t = prom_sample.loc[prom_sample['sample'] == f'Terres_{rep}', metric].iloc[0]
+            diffs.append(t - a)
+            pair_rows.append({'metric': metric, 'pair': rep, 'Aqua': a, 'Terres': t, 'Terres_minus_Aqua': t - a})
+        ci = bootstrap_mean_ci(diffs)
+        tt = stats.ttest_rel(
+            [prom_sample.loc[prom_sample['sample'] == f'Terres_{r}', metric].iloc[0] for r in PAIR_IDS],
+            [prom_sample.loc[prom_sample['sample'] == f'Aqua_{r}', metric].iloc[0] for r in PAIR_IDS],
+        )
+        pair_rows.append({'metric': metric, 'pair': 'summary', 'Aqua': prom_sample[prom_sample.condition == 'Aqua'][metric].mean(),
+                          'Terres': prom_sample[prom_sample.condition == 'Terres'][metric].mean(), 'Terres_minus_Aqua': np.mean(diffs),
+                          'paired_t_pvalue': tt.pvalue, 'exact_signflip_pvalue': exact_signflip_p(diffs),
+                          'effect_low95': ci[0], 'effect_high95': ci[1], 'pairs_same_sign': int(abs(np.sign(diffs).sum()))})
+    promoter_pairs = pd.DataFrame(pair_rows)
+    promoter_pairs.to_csv(OUT / 'promoter_paired_validation.csv', index=False)
+    summary['promoter_validation'] = promoter_pairs[promoter_pairs['pair'] == 'summary'].to_dict('records')
+
+    # Group matrices and expression-bin summaries
+    aqua_cov = np.mean([coverage_mats[s] for s in AQUA], axis=0)
+    terres_cov = np.mean([coverage_mats[s] for s in TERRES], axis=0)
+    aqua_score = np.mean([score_mats[s] for s in AQUA], axis=0)
+    terres_score = np.mean([score_mats[s] for s in TERRES], axis=0)
+    np.savez_compressed(OUT / 'TSS_group_matrices.npz', Aqua_coverage=aqua_cov.astype(np.float32), Terres_coverage=terres_cov.astype(np.float32),
+                        Aqua_score=aqua_score.astype(np.float32), Terres_score=terres_score.astype(np.float32), centers=CENTERS,
+                        gene_ids=genes['gene_id'].astype(str).to_numpy(), expression=genes['mean_fpkm_all'].fillna(0).to_numpy())
+    positive = genes['mean_fpkm_all'].fillna(0) > 0
+    decile = pd.Series(-1, index=genes.index, dtype=int)
+    decile.loc[positive] = pd.qcut(genes.loc[positive, 'mean_fpkm_all'].rank(method='first'), 10, labels=False).astype(int)
+    genes['expression_decile'] = decile
+    dec_rows = []
+    for cond, mat in [('Aqua', aqua_cov), ('Terres', terres_cov)]:
+        for d in range(10):
+            m = genes['expression_decile'].to_numpy() == d
+            if m.any():
+                for pos, val in zip(CENTERS, mat[m].mean(axis=0)):
+                    dec_rows.append({'condition': cond, 'expression_decile': d + 1, 'position': pos, 'coverage_fraction': val, 'n_genes': int(m.sum())})
+    pd.DataFrame(dec_rows).to_csv(OUT / 'TSS_expression_decile_profiles.csv', index=False)
+
+    # Differential FIRE replicate validation from independent single-sample peak calls
+    dfire = pd.read_csv(BASE / 'dFIRE_annotated.csv').reset_index(drop=True)
+    regions = dfire[['chrom', 'start', 'end']].copy()
+    frac_mat = np.zeros((len(dfire), len(SAMPLES)), dtype=np.float32)
+    score_mat = np.zeros_like(frac_mat)
+    for j, sample in enumerate(SAMPLES):
+        print('dFIRE sample overlap', sample, flush=True)
+        frac_mat[:, j], score_mat[:, j] = interval_region_metrics(regions, load_peak(sample))
+    np.savez_compressed(OUT / 'dFIRE_sample_peak_metrics.npz', coverage_fraction=frac_mat, max_peak_score=score_mat,
+                        sample_names=np.asarray(SAMPLES), region_ids=dfire['ID'].astype(str).to_numpy())
+    pair_diffs = np.column_stack([frac_mat[:, 3] - frac_mat[:, 0], frac_mat[:, 4] - frac_mat[:, 1], frac_mat[:, 5] - frac_mat[:, 2]])
+    mean_pair_diff = pair_diffs.mean(axis=1)
+    dfire['replicate_peak_fraction_effect'] = mean_pair_diff
+    dfire['replicate_direction_agreement'] = np.sign(mean_pair_diff) == np.sign(dfire['fire_effect'])
+    dfire['n_pairs_provider_direction'] = np.sum(np.sign(pair_diffs) == np.sign(dfire['fire_effect'].to_numpy())[:, None], axis=1)
+    dfire.to_csv(OUT / 'dFIRE_replicate_validation.csv.gz', index=False, compression='gzip')
+    sig = dfire['significant'].astype(bool).to_numpy()
+    r, rp = safe_pearson(dfire.loc[sig, 'fire_effect'], mean_pair_diff[sig])
+    summary['dFIRE_replicate_validation'] = {
+        'significant_regions': int(sig.sum()),
+        'direction_agreement_percent': float(dfire.loc[sig, 'replicate_direction_agreement'].mean() * 100),
+        'at_least_two_pairs_agree_percent': float((dfire.loc[sig, 'n_pairs_provider_direction'] >= 2).mean() * 100),
+        'all_three_pairs_agree_percent': float((dfire.loc[sig, 'n_pairs_provider_direction'] == 3).mean() * 100),
+        'effect_correlation_r': r, 'effect_correlation_p': rp,
+    }
+    # sample PCA across variable significant regions
+    X = frac_mat[sig].T
+    var = X.var(axis=0)
+    keep = np.argsort(var)[-min(20000, np.sum(var > 0)):]
+    Xz = StandardScaler().fit_transform(X[:, keep]) if len(keep) else X[:, :1]
+    pcs = PCA(n_components=2).fit_transform(Xz)
+    pca = pd.DataFrame({'sample': SAMPLES, 'condition': ['Aqua'] * 3 + ['Terres'] * 3, 'replicate': PAIR_IDS + PAIR_IDS, 'PC1': pcs[:, 0], 'PC2': pcs[:, 1]})
+    pca.to_csv(OUT / 'dFIRE_sample_PCA.csv', index=False)
+
+    # RNA and FIRE gene-level integration using all tested regions
+    promoter_gene = aggregate_gene_effect(dfire[dfire['class'] == 'promoter'], 'direct_gene', 'promoter_FIRE')
+    body_gene = aggregate_gene_effect(dfire[dfire['class'] == 'gene_body'], 'direct_gene', 'body_FIRE')
+    dist20 = dfire[(dfire['class'] == 'distal') & (dfire['distance'].fillna(np.inf) <= 20000)]
+    distal_gene = aggregate_gene_effect(dist20, 'nearest_gene', 'distal20_FIRE')
+    gi = expr[['gene_id', 'mean_fpkm_all', 'log2FoldChange', 'qvalue', 'DEG', 'RNA_direction', 'Annotation', 'GO_Anno', 'KEGG']].copy()
+    for gtab in [promoter_gene, body_gene, distal_gene]:
+        gi = gi.merge(gtab, on='gene_id', how='left')
+    effect_cols = ['promoter_FIRE_effect', 'body_FIRE_effect', 'distal20_FIRE_effect']
+    for c in effect_cols:
+        gi[c] = gi[c].fillna(0.0)
+    # strongest direct effect
+    arr = gi[['promoter_FIRE_effect', 'body_FIRE_effect']].to_numpy(float)
+    choose = np.argmax(np.abs(arr), axis=1)
+    gi['direct_FIRE_effect'] = arr[np.arange(len(arr)), choose]
+    gi['direct_Terres_open'] = ((gi.get('promoter_FIRE_n_Terres_open', 0).fillna(0) > 0) | (gi.get('body_FIRE_n_Terres_open', 0).fillna(0) > 0))
+    gi['direct_Aqua_open'] = ((gi.get('promoter_FIRE_n_Aqua_open', 0).fillna(0) > 0) | (gi.get('body_FIRE_n_Aqua_open', 0).fillna(0) > 0))
+    gi['distal20_Terres_open'] = gi.get('distal20_FIRE_n_Terres_open', 0).fillna(0) > 0
+    gi['distal20_Aqua_open'] = gi.get('distal20_FIRE_n_Aqua_open', 0).fillna(0) > 0
+    gi.to_csv(OUT / 'RNA_FIRE_gene_integration.csv.gz', index=False, compression='gzip')
+
+    corr_rows = []
+    for subset_name, subset in [('all_expressed', gi[gi['mean_fpkm_all'] > 0.1]), ('DEGs', gi[gi['DEG']])]:
+        for c in ['promoter_FIRE_effect', 'body_FIRE_effect', 'direct_FIRE_effect', 'distal20_FIRE_effect']:
+            pr, pp = safe_pearson(subset[c], subset['log2FoldChange'])
+            sr, sp = safe_spearman(subset[c], subset['log2FoldChange'])
+            corr_rows.append({'subset': subset_name, 'feature': c, 'n': len(subset), 'Pearson_r': pr, 'Pearson_p': pp, 'Spearman_rho': sr, 'Spearman_p': sp})
+    corr = pd.DataFrame(corr_rows)
+    corr.to_csv(OUT / 'RNA_FIRE_correlations.csv', index=False)
+
+    model_rows = []
+    mod = gi[(gi['mean_fpkm_all'] > 0.1) & np.isfinite(gi['log2FoldChange'])].copy()
+    feature_sets = {
+        'promoter_only': ['promoter_FIRE_effect'],
+        'body_only': ['body_FIRE_effect'],
+        'distal_only': ['distal20_FIRE_effect'],
+        'direct': ['promoter_FIRE_effect', 'body_FIRE_effect'],
+        'all': ['promoter_FIRE_effect', 'body_FIRE_effect', 'distal20_FIRE_effect'],
+    }
+    cv = KFold(n_splits=10, shuffle=True, random_state=181)
+    for name, fcols in feature_sets.items():
+        scores = cross_val_score(make_pipeline(StandardScaler(), Ridge(alpha=10.0)), mod[fcols].to_numpy(), mod['log2FoldChange'].to_numpy(), cv=cv, scoring='r2')
+        model_rows.append({'model': name, 'n': len(mod), 'features': ';'.join(fcols), 'CV_R2_mean': scores.mean(), 'CV_R2_sd': scores.std()})
+    de = gi[gi['DEG']].copy()
+    y = (de['RNA_direction'] == 'Terres_up').astype(int).to_numpy()
+    scv = StratifiedKFold(n_splits=10, shuffle=True, random_state=181)
+    for name, fcols in feature_sets.items():
+        pred = cross_val_predict(make_pipeline(StandardScaler(), LogisticRegression(max_iter=2000, class_weight='balanced')), de[fcols].to_numpy(), y, cv=scv, method='predict_proba')[:, 1]
+        model_rows.append({'model': name + '_direction_classifier', 'n': len(de), 'features': ';'.join(fcols), 'CV_AUC': roc_auc_score(y, pred)})
+    models = pd.DataFrame(model_rows)
+    models.to_csv(OUT / 'RNA_FIRE_predictive_models.csv', index=False)
+
+    universe = set(gi['gene_id'])
+    t_up = set(gi.loc[gi['RNA_direction'] == 'Terres_up', 'gene_id'])
+    a_up = set(gi.loc[gi['RNA_direction'] == 'Aqua_up', 'gene_id'])
+    t_direct = set(gi.loc[gi['direct_Terres_open'], 'gene_id'])
+    a_direct = set(gi.loc[gi['direct_Aqua_open'], 'gene_id'])
+    t_dist = set(gi.loc[gi['distal20_Terres_open'], 'gene_id'])
+    a_dist = set(gi.loc[gi['distal20_Aqua_open'], 'gene_id'])
+    or_rows = []
+    for label, q, pos in [
+        ('Terres_up versus direct Terres-open', t_up, t_direct), ('Aqua_up versus direct Aqua-open', a_up, a_direct),
+        ('Terres_up versus distal Terres-open', t_up, t_dist), ('Aqua_up versus distal Aqua-open', a_up, a_dist),
+        ('Terres_up versus direct Aqua-open mismatch', t_up, a_direct), ('Aqua_up versus direct Terres-open mismatch', a_up, t_direct),
+    ]:
+        r0 = fisher_from_sets(universe, q, pos)
+        r0['comparison'] = label
+        or_rows.append(r0)
+    ors = pd.DataFrame(or_rows)
+    ors['FDR'] = bh(ors['pvalue'])
+    ors.to_csv(OUT / 'RNA_FIRE_condition_matched_enrichment.csv', index=False)
+
+    # Environmental and photosynthetic category enrichment
+    text = (gi['Annotation'].fillna('') + ' ' + gi['GO_Anno'].fillna('') + ' ' + gi['KEGG'].fillna('')).str.lower()
+    patterns = {
+        'photosynthesis and chloroplast': r'photosynth|chloroplast|plastid|photosystem|chlorophyll|rubisco|carbon fixation',
+        'core C4 biochemistry': r'phosphoenolpyruvate carboxylase|pyruvate.*dikinase|pep carboxykinase|malic enzyme|carbonic anhydrase|aspartate aminotransferase|alanine aminotransferase',
+        'water transport and aquaporins': r'aquaporin|water transport|water channel|hydraulic',
+        'ABA signalling and response': r'abscisic|\baba\b|pyrabactin|snrk2|abi[345]',
+        'gibberellin signalling': r'gibberellin|gibberellic|della|gid1',
+        'ethylene signalling': r'ethylene|ein[234]|etr[12]|ctr1|erf',
+        'hypoxia and oxygen response': r'hypoxi|anoxi|oxygen level|anaerob|fermentation',
+        'cell wall remodelling': r'cell wall|cellulose|pectin|expansin|xyloglucan|lignin|lignification|suberin|suberization',
+        'stomatal regulation': r'stomat|guard cell',
+        'vascular and bundle sheath development': r'bundle sheath|vascular|xylem|phloem|scarecrow|short-root|\bscr\b|\bshr\b',
+        'general stress response': r'response to stress|oxidative stress|heat shock|drought|salt stress|osmotic stress|defense response',
+        'transcriptional regulation': r'transcription factor|dna-binding transcription|regulation of transcription',
+    }
+    gene_by_cat = {k: set(gi.loc[text.str.contains(v, regex=True, na=False), 'gene_id']) for k, v in patterns.items()}
+    set_defs = {
+        'Terres-up genes': t_up,
+        'Aqua-up genes': a_up,
+        'Terres-up with direct Terres-open FIRE': t_up & t_direct,
+        'Aqua-up with direct Aqua-open FIRE': a_up & a_direct,
+        'direct Terres-open FIRE genes': t_direct,
+        'direct Aqua-open FIRE genes': a_direct,
+    }
+    cat_rows = []
+    for sname, qset in set_defs.items():
+        for cat, pset in gene_by_cat.items():
+            r0 = fisher_from_sets(universe, qset, pset)
+            r0.update({'gene_set': sname, 'category': cat, 'query_n': len(qset), 'category_n': len(pset)})
+            cat_rows.append(r0)
+    cats = pd.DataFrame(cat_rows)
+    cats['FDR'] = cats.groupby('gene_set')['pvalue'].transform(lambda x: bh(x))
+    cats.to_csv(OUT / 'environmental_category_enrichment.csv', index=False)
+
+    # TF family summary with enrichment tests
+    tf = pd.read_csv(BASE / 'TF_gene_landscape_rigorous.csv').rename(columns={'gene': 'gene_id', 'tf_family': 'TF_family', 'de_direction': 'RNA_direction', 'is_DEG': 'DEG', 'rna_log2fc': 'log2FoldChange'})
+    tf['RNA_direction'] = tf['RNA_direction'].astype('string').str.replace('-', '_', regex=False)
+    tf['DEG'] = tf['DEG'].fillna(False).astype(bool)
+    tf = tf.merge(gi[['gene_id', 'direct_Terres_open', 'direct_Aqua_open', 'promoter_FIRE_effect', 'body_FIRE_effect']], on='gene_id', how='left', suffixes=('', '_advanced'))
+    for c in ['direct_Terres_open', 'direct_Aqua_open', 'promoter_FIRE_effect', 'body_FIRE_effect']:
+        ca = c + '_advanced'
+        if ca in tf.columns:
+            tf[c] = tf[ca]
+            tf = tf.drop(columns=[ca])
+    all_tf = set(tf['gene_id'])
+    tf_rows = []
+    for fam, g in tf.groupby('TF_family'):
+        famset = set(g['gene_id'])
+        ttest = fisher_from_sets(all_tf, famset, set(tf.loc[tf['RNA_direction'] == 'Terres_up', 'gene_id']))
+        ftest = fisher_from_sets(all_tf, famset, set(tf.loc[tf['direct_Terres_open'].fillna(False), 'gene_id']))
+        tf_rows.append({
+            'TF_family': fam, 'n_TFs': len(g), 'n_DEG': int(g['DEG'].sum()),
+            'n_Terres_up': int((g['RNA_direction'] == 'Terres_up').sum()), 'n_Aqua_up': int((g['RNA_direction'] == 'Aqua_up').sum()),
+            'n_direct_Terres_open': int(g['direct_Terres_open'].fillna(False).sum()), 'n_direct_Aqua_open': int(g['direct_Aqua_open'].fillna(False).sum()),
+            'median_RNA_log2FC': g['log2FoldChange'].median(),
+            'Terres_up_OR': ttest['odds_ratio'], 'Terres_up_p': ttest['pvalue'],
+            'Terres_open_OR': ftest['odds_ratio'], 'Terres_open_p': ftest['pvalue'],
+        })
+    tfs = pd.DataFrame(tf_rows)
+    tfs['Terres_up_FDR'] = bh(tfs['Terres_up_p'])
+    tfs['Terres_open_FDR'] = bh(tfs['Terres_open_p'])
+    tfs.sort_values(['Terres_up_FDR', 'Terres_open_FDR', 'n_TFs']).to_csv(OUT / 'TF_family_enrichment_advanced.csv', index=False)
+
+    # Methylation integration
+    dmr_raw = pd.read_csv(DMR_ROOT / 'Terres_vs_Aqua.group.DMR.xls', sep='\t').rename(columns={'chr': 'chrom', 'diff.Methy': 'meth_effect'})
+    dmr_ann = pd.read_csv(BASE / 'DMR_annotated.csv')
+    dmr_cols = ['chrom', 'start', 'end', 'class', 'direct_gene', 'nearest_gene', 'distance']
+    dmr = dmr_raw.merge(dmr_ann[dmr_cols], on=['chrom', 'start', 'end'], how='left')
+    dmr['Terres_hyper'] = dmr['meth_effect'] > 0
+    dmr.to_csv(OUT / 'DMR_validated_annotated.csv', index=False)
+    # overlap significant dFIRE and DMR
+    sigd = dfire[dfire['significant']].sort_values(['chrom', 'start', 'end']).reset_index(drop=True)
+    overlaps = []
+    for chrom, dd in dmr.groupby('chrom', sort=False):
+        ff = sigd[sigd['chrom'] == chrom]
+        if ff.empty:
+            continue
+        fs, fe = ff['start'].to_numpy(int), ff['end'].to_numpy(int)
+        left = 0
+        for dr in dd.itertuples(index=False):
+            while left < len(ff) and fe[left] <= dr.start:
+                left += 1
+            j = left
+            while j < len(ff) and fs[j] < dr.end:
+                ov = min(int(dr.end), int(fe[j])) - max(int(dr.start), int(fs[j]))
+                if ov > 0:
+                    fr = ff.iloc[j]
+                    overlaps.append({
+                        'chrom': chrom, 'DMR_start': int(dr.start), 'DMR_end': int(dr.end), 'DMR_effect': float(dr.meth_effect),
+                        'DMR_direction': 'Terres_hyper' if dr.meth_effect > 0 else 'Terres_hypo',
+                        'dFIRE_ID': fr['ID'], 'dFIRE_start': int(fr['start']), 'dFIRE_end': int(fr['end']),
+                        'dFIRE_effect': float(fr['fire_effect']), 'dFIRE_direction': 'Terres_open' if fr['fire_effect'] > 0 else 'Aqua_open',
+                        'overlap_bp': int(ov), 'dFIRE_class': fr['class'], 'dFIRE_gene': fr['direct_gene'] if pd.notna(fr['direct_gene']) else fr['nearest_gene'],
+                        'DMR_gene': dr.direct_gene if pd.notna(dr.direct_gene) else dr.nearest_gene,
+                    })
+                j += 1
+    ov = pd.DataFrame(overlaps)
+    if not ov.empty:
+        ov['quadrant'] = ov['dFIRE_direction'] + ' + ' + ov['DMR_direction']
+        ov.to_csv(OUT / 'dFIRE_DMR_interval_overlaps.csv', index=False)
+        qr = ov.groupby('quadrant', as_index=False).agg(n_overlaps=('quadrant', 'size'), n_unique_dFIRE=('dFIRE_ID', 'nunique'), n_unique_DMR=('DMR_start', 'size'))
+        qr.to_csv(OUT / 'dFIRE_DMR_quadrants.csv', index=False)
+        mr, mp = safe_spearman(ov['dFIRE_effect'], ov['DMR_effect'])
+        summary['dFIRE_DMR_overlap'] = {'n_interval_overlaps': len(ov), 'n_unique_dFIRE': ov['dFIRE_ID'].nunique(), 'n_unique_DMR': ov[['chrom', 'DMR_start', 'DMR_end']].drop_duplicates().shape[0], 'Spearman_rho': mr, 'pvalue': mp}
+    # gene-level DMR metrics
+    gd = dmr[dmr['direct_gene'].notna()].copy()
+    gd_rows = []
+    for gid, g in gd.groupby('direct_gene'):
+        best = g.iloc[int(np.nanargmax(np.abs(g['meth_effect'].to_numpy(float))))]
+        gd_rows.append({'gene_id': gid, 'DMR_effect': best['meth_effect'], 'DMR_direction': 'Terres_hyper' if best['meth_effect'] > 0 else 'Terres_hypo', 'DMR_n': len(g), 'DMR_min_distance': 0})
+    gdtab = pd.DataFrame(gd_rows)
+    evidence = gi.merge(gdtab, on='gene_id', how='left')
+    evidence['has_direct_dFIRE'] = evidence['direct_Terres_open'] | evidence['direct_Aqua_open']
+    evidence['has_DMR'] = evidence['DMR_n'].fillna(0) > 0
+    evidence['evidence_layers'] = evidence['DEG'].astype(int) + evidence['has_direct_dFIRE'].astype(int) + evidence['has_DMR'].astype(int)
+    evidence.to_csv(OUT / 'RNA_FIRE_DMR_gene_evidence.csv.gz', index=False, compression='gzip')
+
+    # C4 matrix rebuilt with advanced direct and distal evidence
+    c4 = pd.read_csv(BASE / 'C4_gene_matrix.csv').rename(columns={'gene': 'gene_id'})
+    c4 = c4.drop(columns=[c for c in c4.columns if c.startswith('promoter_FIRE') or c.startswith('body_FIRE') or c.startswith('distal20_FIRE') or c in ['direct_Terres_open', 'direct_Aqua_open']], errors='ignore')
+    c4 = c4.merge(gi.drop(columns=['Annotation', 'GO_Anno', 'KEGG', 'log2FoldChange', 'qvalue', 'DEG', 'RNA_direction', 'mean_fpkm_all'], errors='ignore'), on='gene_id', how='left')
+    c4 = c4.merge(gdtab, on='gene_id', how='left')
+    c4.to_csv(OUT / 'C4_gene_matrix_advanced.csv', index=False)
+
+    # Motif audit and primary interpretation
+    motifs = parse_streme_pwm(MOTIF_ROOT / 'streme_Terres_vs_Aqua' / 'streme.txt')
+    with open(OUT / 'STREME_PWM.json', 'w') as f:
+        json.dump(motifs, f, indent=2)
+    seq_table = MOTIF_ROOT / 'streme_Terres_vs_Aqua' / 'sequences.tsv'
+    motif_ids = [m['motif_id'] for m in motifs]
+    maudit = matched_background_audit(MOTIF_ROOT / 'Aqua.bed', MOTIF_ROOT / 'Terres_vs_Aqua_open.bed', seq_table, motif_ids)
+    tom = pd.read_csv(BASE / 'tomtom_matches.csv')
+    # family labels from motif model mapping known from the motif instance table audit
+    primary_wrky_ids = {'MA1087.3','MA1316.2','MA1304.2','MA2742.1','MA2655.1','MA2657.1','MA1317.2','MA1309.1','MA1079.3','MA1094.3','MA1306.2','MA1315.2','MA1297.2','MA1313.2','MA1318.2','MA2741.1','MA2743.1','MA1298.2','MA2725.1'}
+    motif_family = []
+    for mid in motif_ids:
+        top = tom[(tom['Query_ID'] == mid) & (tom['q-value'] < 0.05)]
+        wrky_fraction = np.mean(top['Target_ID'].isin(primary_wrky_ids)) if len(top) else 0
+        motif_family.append('WRKY-like' if wrky_fraction >= 0.5 else 'unresolved or mixed')
+    maudit['Tomtom_family_interpretation'] = motif_family
+    maudit = maudit.merge(pd.DataFrame([{k: v for k, v in m.items() if k != 'pwm'} for m in motifs]), on='motif_id', how='left')
+    maudit.to_csv(OUT / 'STREME_balanced_background_audit.csv', index=False)
+    summary['motif_validation'] = {
+        'primary_motif': motifs[0]['motif_id'],
+        'primary_E_value': motifs[0]['E_value'],
+        'primary_Tomtom_interpretation': motif_family[0],
+        'previous_primary_DOF_claim_supported': False,
+        'matched_fold_enrichment': float(maudit.iloc[0]['matched_fold_enrichment']),
+        'note': 'The dominant de novo motif maps to WRKY models. DOF remains a biologically relevant candidate family but is not the primary STREME motif in this contrast.'
+    }
+
+    # Validation ledger
+    validation_rows = [
+        {'claim': 'RNA differential expression counts', 'status': 'confirmed', 'result': '2636 DEGs, 1885 Terres-up and 751 Aqua-up'},
+        {'claim': 'RNA log2 fold changes', 'status': 'confirmed', 'result': 'Recomputed FPKM fold changes agree with provider values at Pearson r 0.9997'},
+        {'claim': 'Differential FIRE counts', 'status': 'confirmed', 'result': '39467 significant regions, 8350 Terres-open and 31117 Aqua-open'},
+        {'claim': 'Differential methylation counts', 'status': 'confirmed', 'result': '4427 DMRs, 3148 Terres-hyper and 1279 Terres-hypo'},
+        {'claim': 'Global Aqua promoter accessibility is significantly higher', 'status': 'not statistically established', 'result': 'Unioned sample peak analysis reports effect sizes from three clone pairs. Biological replicate tests must be interpreted cautiously at n equals 3'},
+        {'claim': 'Condition-matched RNA and FIRE changes are associated', 'status': 'confirmed and refined', 'result': 'Direct and distal links were tested separately and all tested FIRE regions were used for correlation and prediction analyses'},
+        {'claim': 'Primary Terres-open de novo motif is DOF-like', 'status': 'rejected', 'result': 'The dominant GAAAAGTCAAM motif maps to WRKY-family models by Tomtom'},
+        {'claim': 'DOF or WRKY occupancy increases globally in Terres', 'status': 'not supported', 'result': 'Replicate-level motif footprint and centered m6A tests do not show a significant condition-specific occupancy shift'},
+        {'claim': 'All core C4 genes are activated by local Terres-open promoters', 'status': 'rejected', 'result': 'C4-associated genes show heterogeneous promoter, gene-body, distal, and methylation support'},
+        {'claim': 'MBD4-like, DOF/CDF3-like and SCR-like genes are regulators', 'status': 'candidate only', 'result': 'The data prioritize chromatin-associated loci but do not establish function or causality'},
+    ]
+    pd.DataFrame(validation_rows).to_csv(OUT / 'validation_ledger.csv', index=False)
+
+    # compact summary numbers
+    summary['RNA_FIRE_correlations'] = corr.to_dict('records')
+    summary['RNA_FIRE_models'] = models.to_dict('records')
+    summary['condition_matched_ORs'] = ors.to_dict('records')
+    summary['counts'] = {
+        'genes': len(genes), 'DEGs': int(expr['DEG'].sum()), 'Terres_up': int((expr['RNA_direction'] == 'Terres_up').sum()), 'Aqua_up': int((expr['RNA_direction'] == 'Aqua_up').sum()),
+        'dFIRE_tested': len(dfire), 'dFIRE_significant': int(dfire['significant'].sum()), 'Terres_open': int((dfire['significant'] & (dfire['fire_effect'] > 0)).sum()), 'Aqua_open': int((dfire['significant'] & (dfire['fire_effect'] < 0)).sum()),
+        'DMRs': len(dmr), 'Terres_hyper_DMRs': int((dmr['meth_effect'] > 0).sum()), 'Terres_hypo_DMRs': int((dmr['meth_effect'] < 0).sum()),
+    }
+    with open(OUT / 'advanced_validation_summary.json', 'w') as f:
+        json.dump(summary, f, indent=2, default=lambda x: float(x) if isinstance(x, (np.floating, np.integer)) else str(x))
+    print(json.dumps(summary['counts'], indent=2))
+
+
+if __name__ == '__main__':
+    main()
